@@ -75,6 +75,48 @@ def parse_srt(content):
     return blocks
 
 
+def parse_timestamp(ts_str):
+    """將 SRT 時間字串 HH:MM:SS,mmm 轉為毫秒"""
+    m = re.match(r'(\d+):(\d{2}):(\d{2}),(\d{3})', ts_str.strip())
+    if not m:
+        return None
+    h, mn, s, ms = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    return h * 3600000 + mn * 60000 + s * 1000 + ms
+
+
+def format_timestamp(total_ms):
+    """將毫秒轉回 SRT 時間字串 HH:MM:SS,mmm"""
+    h = total_ms // 3600000
+    total_ms %= 3600000
+    mn = total_ms // 60000
+    total_ms %= 60000
+    s = total_ms // 1000
+    ms = total_ms % 1000
+    return f'{h:02d}:{mn:02d}:{s:02d},{ms:03d}'
+
+
+def fix_overlaps(blocks):
+    """若當前字幕結束時間 > 下一字幕開始時間，將結束時間縮短至下一字幕的開始時間"""
+    valid = [b for b in blocks if b.get('index') is not None]
+    fixed = 0
+    for i in range(len(valid) - 1):
+        cur_parts = valid[i]['timestamp'].split('-->')
+        next_parts = valid[i + 1]['timestamp'].split('-->')
+        if len(cur_parts) != 2 or len(next_parts) != 2:
+            continue
+        cur_end_ms = parse_timestamp(cur_parts[1])
+        next_start_ms = parse_timestamp(next_parts[0])
+        if cur_end_ms is None or next_start_ms is None:
+            continue
+        if cur_end_ms > next_start_ms:
+            new_end = format_timestamp(next_start_ms)
+            old_ts = valid[i]['timestamp']
+            valid[i]['timestamp'] = cur_parts[0].rstrip() + ' --> ' + new_end
+            print(f'  修正重疊: [{old_ts}] -> [{valid[i]["timestamp"]}]')
+            fixed += 1
+    return fixed
+
+
 def should_delete(block, patterns, compiled):
     """判斷字幕區塊是否符合刪除條件"""
     if block.get('index') is None:
@@ -132,13 +174,15 @@ def process_srt(file_path, patterns, compiled):
         else:
             kept.append(block)
 
+    overlap_fixed = fix_overlaps(kept)
     output = rebuild_srt(kept)
 
     write_enc = 'utf-8-sig' if used_encoding == 'utf-8-sig' else 'utf-8'
     with open(file_path, 'w', encoding=write_enc, newline='') as f:
         f.write(output)
 
-    print(f'  完成: 共 {total} 條，刪除 {deleted} 條，保留 {total - deleted} 條')
+    overlap_msg = f'，修正重疊 {overlap_fixed} 條' if overlap_fixed else ''
+    print(f'  完成: 共 {total} 條，刪除 {deleted} 條，保留 {total - deleted} 條{overlap_msg}')
 
 
 def main():
