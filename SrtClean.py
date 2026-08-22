@@ -25,29 +25,44 @@ def load_config():
     system_prompt = data.get('prompt', '')
     model = data.get('model', 'gpt-4o-mini')
     api_key = data.get('apiKey', 'no-key')
+    reasoning_effort = data.get('reasoning_effort', None)
+    reasoning_tokens = data.get('reasoning_tokens', None)
+    retry_output = [s.strip() for s in data.get('retryOutput', []) if isinstance(s, str) and s.strip()]
+
+    try:
+        words_per_op = int(data.get('wordsPerOp', 0) or 0)
+    except (TypeError, ValueError):
+        words_per_op = 0
+    if words_per_op < 0:
+        words_per_op = 0
 
     if not api_url:
         print('[錯誤] SrtClean.json 缺少 apiUrl')
         input('\n按 Enter 結束...')
         sys.exit(1)
 
-    return api_url, system_prompt, model, api_key
+    return Config(api_url, system_prompt, model, api_key, reasoning_effort,
+                  reasoning_tokens, retry_output, words_per_op)
 
 
-def call_llm(api_url, system_prompt, model, api_key, text):
-    url = api_url + '/v1/chat/completions'
+def call_llm(cfg, text):
+    url = cfg.api_url + '/v1/chat/completions'
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {api_key}',
+        'Authorization': f'Bearer {cfg.api_key}',
     }
     payload = {
-        'model': model,
+        'model': cfg.model,
         'messages': [
-            {'role': 'system', 'content': system_prompt},
+            {'role': 'system', 'content': cfg.system_prompt},
             {'role': 'user', 'content': text},
         ],
         'stream': False,
     }
+    if cfg.reasoning_effort is not None:
+        payload['reasoning_effort'] = cfg.reasoning_effort
+    if cfg.reasoning_tokens is not None:
+        payload['reasoning_tokens'] = cfg.reasoning_tokens
     resp = requests.post(url, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
     data = resp.json()
@@ -87,7 +102,11 @@ def rebuild_srt(blocks):
     return '\n'.join(lines).rstrip('\n') + '\n'
 
 
-def process_srt(file_path, api_url, system_prompt, model, api_key):
+def is_retry_output(text, retry_output):
+    return any(text == s for s in retry_output)
+
+
+def process_srt(file_path, api_url, system_prompt, model, api_key, reasoning_effort, retry_output):
     print(f'處理: {file_path}')
 
     content = None
@@ -119,7 +138,14 @@ def process_srt(file_path, api_url, system_prompt, model, api_key):
         if not original:
             continue
         try:
-            cleaned = call_llm(api_url, system_prompt, model, api_key, original)
+            cleaned = call_llm(api_url, system_prompt, model, api_key, reasoning_effort, original)
+            if retry_output and is_retry_output(cleaned, retry_output):
+                print(f'  [{done}/{total}] [重試] LLM 輸出命中 retryOutput，重試一次...')
+                retry = call_llm(api_url, system_prompt, model, api_key, reasoning_effort, original)
+                if is_retry_output(retry, retry_output):
+                    print(f'  [{done}/{total}] [跳過] 重試仍命中 retryOutput，保留原文')
+                    continue
+                cleaned = retry
             block['text'] = cleaned
             orig_preview = original.replace('\n', ' ')[:50]
             clean_preview = cleaned.replace('\n', ' ')[:50]
@@ -146,13 +172,15 @@ def main():
         print('    "apiUrl": "http://192.168.1.1:8080",')
         print('    "prompt": "給 LLM 的系統提示詞，用來修飾 srt 文本",')
         print('    "model": "gpt-4o-mini",')
-        print('    "apiKey": "your-api-key"')
+        print('    "apiKey": "your-api-key",')
+        print('    "reasoning_effort": "low"')
         print('  }')
         input('\n按 Enter 結束...')
         sys.exit(0)
 
-    api_url, system_prompt, model, api_key = load_config()
-    print(f'API: {api_url}  模型: {model}')
+    api_url, system_prompt, model, api_key, reasoning_effort, retry_output = load_config()
+    effort_info = f'  reasoning_effort: {reasoning_effort}' if reasoning_effort else ''
+    print(f'API: {api_url}  模型: {model}{effort_info}')
     print()
 
     srt_files = [f for f in sys.argv[1:] if f.lower().endswith('.srt')]
@@ -166,7 +194,7 @@ def main():
         if not os.path.exists(file_path):
             print(f'[錯誤] 找不到檔案: {file_path}')
             continue
-        process_srt(file_path, api_url, system_prompt, model, api_key)
+        process_srt(file_path, api_url, system_prompt, model, api_key, reasoning_effort, retry_output)
         print()
 
     input('全部完成。按 Enter 結束...')
