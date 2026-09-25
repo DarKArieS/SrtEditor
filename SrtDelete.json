@@ -1,9 +1,0 @@
-{
-    "deleteTargetRegex": [
-        "^範例正規表達式$"
-    ],
-    "deleteTarget": [
-        "範例字幕，這條會被刪除",
-        "廣告字幕"
-    ]
-}
