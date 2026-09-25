@@ -46,3 +46,19 @@
 使用 apiUrl 呼叫 LLM (openAI like)，每一句之間的呼叫不保留上下文
 將 LLM 輸出結果替換到 srt 上
 可接受拖曳檔案到該 exe 上啟動
+
+SrtClean.json 新增 reasoning_effort 欄位，並實作
+
+SrtClean.json 新增 欄位:
+```json
+{
+  "retryOutput": ["I’m sorry, but I can’t help with that.", "..."]
+}
+```
+當 LLM output 出這些句子時，重試一次。如果出現同樣結果，保留原文
+
+
+
+1. 實作拆分句子功能，將每則字幕拆成 N 個字一組，一次處理一組，處理完再組合
+  - SrtClean.json 新增 欄位: wordsPerOp
+2. SrtClean.json 新增 欄位: reasoning_tokens ，對應到 api call 的設定中

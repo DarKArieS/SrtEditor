@@ -91,7 +91,10 @@ SrtClean.exe file1.srt file2.srt ...
     "apiUrl": "http://192.168.1.1:8080",
     "prompt": "給 LLM 的系統提示詞，用來修飾 srt 文本",
     "model": "gpt-4o-mini",
-    "apiKey": "your-api-key"
+    "apiKey": "your-api-key",
+    "reasoning_effort": "low",
+    "retryOutput": ["很抱歉，我無法協助處理這個要求。"],
+    "wordsPerOp": 20
 }
 ```
 
@@ -101,6 +104,16 @@ SrtClean.exe file1.srt file2.srt ...
 | `prompt` | 是 | LLM 的系統提示詞 |
 | `model` | 否 | 模型名稱，預設 `gpt-4o-mini` |
 | `apiKey` | 否 | API 金鑰，本機服務填 `no-key` 即可 |
+| `reasoning_effort` | 否 | 有填才會帶入 API 請求，例如 `low` / `medium` / `high` |
+| `reasoning_tokens` | 否 | 有填才會帶入 API 請求 |
+| `retryOutput` | 否 | LLM 輸出命中清單中的句子時重試一次，重試仍命中則保留原文 |
+| `wordsPerOp` | 否 | 每則字幕拆成 N 個字一組，一組一次呼叫，處理完再組合；`0` 或省略表示整則一次處理 |
+
+#### wordsPerOp 拆分規則
+
+- 中日韓文字每個字算一個字，連續的英數字（如 `emergency`）算一個字，標點不計數且會留在前一組
+- 每一組都是原文的精確切片，組合時不會遺失空白或換行
+- 某一組呼叫失敗或重試仍命中 `retryOutput` 時，只有該組保留原文，其餘照常替換
 
 ### 執行範例
 

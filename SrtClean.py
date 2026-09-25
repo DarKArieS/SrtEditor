@@ -2,7 +2,19 @@ import sys
 import json
 import os
 import re
+from collections import namedtuple
+
 import requests
+
+
+Config = namedtuple('Config', [
+    'api_url', 'system_prompt', 'model', 'api_key',
+    'reasoning_effort', 'reasoning_tokens', 'retry_output', 'words_per_op',
+])
+
+# 一個「字」：連續的拉丁字母/數字算一個字，CJK 或其他非空白字元各算一個 token
+LATIN = r"[A-Za-zÀ-ɏ0-9]+(?:['’-][A-Za-zÀ-ɏ0-9]+)*"
+TOKEN_RE = re.compile(LATIN + r"|\S")
 
 
 def get_exe_dir():
@@ -106,7 +118,88 @@ def is_retry_output(text, retry_output):
     return any(text == s for s in retry_output)
 
 
-def process_srt(file_path, api_url, system_prompt, model, api_key, reasoning_effort, retry_output):
+def split_by_words(text, words_per_op):
+    """將 text 拆成每組最多 words_per_op 個字。
+
+    每組都是 text 的原始切片，''.join(結果) == text，
+    組合回去時不會遺失任何空白或換行。
+    標點會留在前一組，不會被切成下一組的開頭。
+    """
+    if words_per_op <= 0:
+        return [text]
+
+    tokens = list(TOKEN_RE.finditer(text))
+    if not tokens:
+        return [text]
+
+    starts = [0]
+    count = 0
+    for i, token in enumerate(tokens):
+        if token.group()[0].isalnum():
+            count += 1
+        if count < words_per_op or i + 1 >= len(tokens):
+            continue
+        # 標點留在本組，遇到下一個「字」才切開
+        if tokens[i + 1].group()[0].isalnum():
+            starts.append(tokens[i + 1].start())
+            count = 0
+
+    bounds = starts + [len(text)]
+    return [text[bounds[i]:bounds[i + 1]] for i in range(len(bounds) - 1)]
+
+
+def clean_once(cfg, text, label):
+    """呼叫 LLM 修飾 text。命中 retryOutput 會重試一次，仍命中則回傳 None（保留原文）。"""
+    cleaned = call_llm(cfg, text)
+    if cfg.retry_output and is_retry_output(cleaned, cfg.retry_output):
+        print(f'{label} [重試] LLM 輸出命中 retryOutput，重試一次...')
+        cleaned = call_llm(cfg, text)
+        if is_retry_output(cleaned, cfg.retry_output):
+            print(f'{label} [跳過] 重試仍命中 retryOutput，保留原文')
+            return None
+    return cleaned
+
+
+def clean_text(cfg, text, label):
+    """依 wordsPerOp 拆成 N 個字一組，一次處理一組，處理完再組合。
+
+    回傳 (組合後的文字, 失敗的組數)。失敗的組保留原文。
+    """
+    chunks = split_by_words(text, cfg.words_per_op)
+    parts = []
+    failed = 0
+
+    for i, chunk in enumerate(chunks, 1):
+        core = chunk.strip()
+        if not core:
+            parts.append(chunk)
+            continue
+
+        lead = chunk[:len(chunk) - len(chunk.lstrip())]
+        trail = chunk[len(chunk.rstrip()):]
+        chunk_label = label if len(chunks) == 1 else f'{label} ({i}/{len(chunks)})'
+
+        try:
+            cleaned = clean_once(cfg, core, chunk_label)
+        except Exception as e:
+            print(f'{chunk_label} [錯誤] {e}，保留原文')
+            cleaned = None
+
+        if cleaned is None:
+            failed += 1
+            cleaned = core
+        parts.append(lead + cleaned + trail)
+
+    result = ''.join(parts)
+    if len(chunks) > 1:
+        # 某一組被整段清掉時，避免留下多餘空白
+        result = re.sub(r'[ \t]{2,}', ' ', result)
+        result = '\n'.join(line.strip() for line in result.split('\n')).strip()
+
+    return result, failed
+
+
+def process_srt(file_path, cfg):
     print(f'處理: {file_path}')
 
     content = None
@@ -137,21 +230,16 @@ def process_srt(file_path, api_url, system_prompt, model, api_key, reasoning_eff
         original = block['text'].strip()
         if not original:
             continue
-        try:
-            cleaned = call_llm(api_url, system_prompt, model, api_key, reasoning_effort, original)
-            if retry_output and is_retry_output(cleaned, retry_output):
-                print(f'  [{done}/{total}] [重試] LLM 輸出命中 retryOutput，重試一次...')
-                retry = call_llm(api_url, system_prompt, model, api_key, reasoning_effort, original)
-                if is_retry_output(retry, retry_output):
-                    print(f'  [{done}/{total}] [跳過] 重試仍命中 retryOutput，保留原文')
-                    continue
-                cleaned = retry
-            block['text'] = cleaned
-            orig_preview = original.replace('\n', ' ')[:50]
-            clean_preview = cleaned.replace('\n', ' ')[:50]
-            print(f'  [{done}/{total}] \n {orig_preview!r} -> \n {clean_preview!r}')
-        except Exception as e:
-            print(f'  [{done}/{total}] [錯誤] {e}，保留原文')
+
+        label = f'  [{done}/{total}]'
+        cleaned, failed = clean_text(cfg, original, label)
+        if failed and cleaned == original:
+            continue
+
+        block['text'] = cleaned
+        orig_preview = original.replace('\n', ' ')[:50]
+        clean_preview = cleaned.replace('\n', ' ')[:50]
+        print(f'{label} \n {orig_preview!r} -> \n {clean_preview!r}')
 
     output = rebuild_srt(blocks)
     write_enc = 'utf-8-sig' if used_encoding == 'utf-8-sig' else 'utf-8'
@@ -173,14 +261,24 @@ def main():
         print('    "prompt": "給 LLM 的系統提示詞，用來修飾 srt 文本",')
         print('    "model": "gpt-4o-mini",')
         print('    "apiKey": "your-api-key",')
-        print('    "reasoning_effort": "low"')
+        print('    "reasoning_effort": "low",')
+        print('    "retryOutput": ["很抱歉，我無法協助處理這個要求。"],')
+        print('    "wordsPerOp": 20')
         print('  }')
+        print()
+        print('  wordsPerOp: 每則字幕拆成 N 個字一組分次處理，0 或省略表示整則一次處理')
         input('\n按 Enter 結束...')
         sys.exit(0)
 
-    api_url, system_prompt, model, api_key, reasoning_effort, retry_output = load_config()
-    effort_info = f'  reasoning_effort: {reasoning_effort}' if reasoning_effort else ''
-    print(f'API: {api_url}  模型: {model}{effort_info}')
+    cfg = load_config()
+    info = f'API: {cfg.api_url}  模型: {cfg.model}'
+    if cfg.reasoning_effort:
+        info += f'  reasoning_effort: {cfg.reasoning_effort}'
+    if cfg.reasoning_tokens:
+        info += f'  reasoning_tokens: {cfg.reasoning_tokens}'
+    if cfg.words_per_op:
+        info += f'  wordsPerOp: {cfg.words_per_op}'
+    print(info)
     print()
 
     srt_files = [f for f in sys.argv[1:] if f.lower().endswith('.srt')]
@@ -194,7 +292,7 @@ def main():
         if not os.path.exists(file_path):
             print(f'[錯誤] 找不到檔案: {file_path}')
             continue
-        process_srt(file_path, api_url, system_prompt, model, api_key, reasoning_effort, retry_output)
+        process_srt(file_path, cfg)
         print()
 
     input('全部完成。按 Enter 結束...')
